@@ -8,4 +8,4 @@ Right now it provides only a stub API.
 ## Install
 
 ```bash
-go get github.com/<org-name>/embeddinggemma@latest
+go get github.com/gomithril/embeddinggemma@latest
