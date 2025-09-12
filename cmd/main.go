@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"os"
 
 	"github.com/gomithril/embeddinggemma/codec"
 	"github.com/gomithril/embeddinggemma/embedding"
@@ -14,26 +15,24 @@ func main() {
 		log.Fatalf("Error loading .env file: %v", err)
 	}
 
+	data, err := os.ReadFile("input.txt")
+	if err != nil {
+		panic(fmt.Errorf("failed to read file: %w", err))
+	}
+	text := string(data)
+
 	textCodec, err := codec.NewCodec()
 	if err != nil {
 		log.Fatalf("Failed to initialize text codec: %v", err)
 	}
 
-	text := "Mithril flows strong in Erebor"
-
 	ids := textCodec.Encode(text)
 
-	// Create embedding service with default config
-	service := embedding.NewService(nil)
-
-	// Generate embeddings
-	embeddings, err := service.Generate(ids)
+	svc := embedding.NewService(nil)
+	chunkedIds := svc.ChunkText(ids)
+	embeddings, err := svc.GenerateBatch(chunkedIds)
 	if err != nil {
-		log.Fatalf("Failed to generate embeddings: %v", err)
+		log.Fatalln("Unable to generate embeddings")
 	}
-
-	fmt.Printf("✅ Sentence embedding generated: length=%d\n", len(embeddings))
-	if len(embeddings) >= 10 {
-		fmt.Printf("🔍 First 10 dims: %v\n", embeddings[:10])
-	}
+	fmt.Println(len(embeddings))
 }

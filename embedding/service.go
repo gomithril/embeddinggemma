@@ -19,7 +19,7 @@ type Config struct {
 func DefaultConfig() *Config {
 	return &Config{
 		ModelPath: "models/model.onnx",
-		SeqLen:    16,
+		SeqLen:    512,
 		EmbedDim:  768,
 	}
 }
@@ -142,4 +142,117 @@ func (s *Service) Generate(ids []int64) ([]float32, error) {
 	sentenceEmbedding := sentenceEmbedTensor.GetData()
 
 	return sentenceEmbedding, nil
+}
+
+func (s *Service) prepareBatchTensors(batch [][]int64) (*onnx.ModelIO, error) {
+	batchSize := int64(len(batch))
+	seqLen := s.config.SeqLen
+
+	// Prepare padded IDs and masks
+	paddedIds := make([]int64, batchSize*seqLen)
+	attMask := make([]int64, batchSize*seqLen)
+
+	for b, ids := range batch {
+		for i := 0; i < int(seqLen) && i < len(ids); i++ {
+			paddedIds[b*int(seqLen)+i] = ids[i]
+			attMask[b*int(seqLen)+i] = 1
+		}
+	}
+
+	// Create input tensors
+	inputIdsTensor, err := ort.NewTensor(ort.NewShape(batchSize, seqLen), paddedIds)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create input_ids tensor: %v", err)
+	}
+
+	attMaskTensor, err := ort.NewTensor(ort.NewShape(batchSize, seqLen), attMask)
+	if err != nil {
+		inputIdsTensor.Destroy()
+		return nil, fmt.Errorf("failed to create attention_mask tensor: %v", err)
+	}
+
+	// Create output tensors
+	tokenEmbedsTensor, err := ort.NewEmptyTensor[float32](ort.NewShape(batchSize, seqLen, s.config.EmbedDim))
+	if err != nil {
+		inputIdsTensor.Destroy()
+		attMaskTensor.Destroy()
+		return nil, fmt.Errorf("failed to create token_embeddings tensor: %v", err)
+	}
+
+	sentenceEmbedTensor, err := ort.NewEmptyTensor[float32](ort.NewShape(batchSize, s.config.EmbedDim))
+	if err != nil {
+		inputIdsTensor.Destroy()
+		attMaskTensor.Destroy()
+		tokenEmbedsTensor.Destroy()
+		return nil, fmt.Errorf("failed to create sentence_embedding tensor: %v", err)
+	}
+
+	io := &onnx.ModelIO{}
+	io.AddInput("input_ids", inputIdsTensor)
+	io.AddInput("attention_mask", attMaskTensor)
+	io.AddOutput("token_embeddings", tokenEmbedsTensor)
+	io.AddOutput("sentence_embedding", sentenceEmbedTensor)
+
+	return io, nil
+}
+
+// GenerateBatch processes multiple sequences at once
+func (s *Service) GenerateBatch(batch [][]int64) ([][]float32, error) {
+	if err := s.initializeONNXRuntime(); err != nil {
+		return nil, fmt.Errorf("failed to init ONNX runtime: %v", err)
+	}
+
+	io, err := s.prepareBatchTensors(batch)
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() {
+		for _, tensor := range io.InputTensors {
+			tensor.Destroy()
+		}
+
+		for _, tensor := range io.OutputTensors {
+			tensor.Destroy()
+		}
+	}()
+
+	session, err := io.AttachToSession(s.config.ModelPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create session: %v", err)
+	}
+	defer session.Destroy()
+
+	if err := session.Run(); err != nil {
+		return nil, fmt.Errorf("inference failed: %v", err)
+	}
+
+	// Extract sentence embeddings for each batch element
+	sentenceEmbedValue := io.OutputTensors[len(io.OutputTensors)-1]
+	sentenceEmbedTensor, ok := sentenceEmbedValue.(*ort.Tensor[float32])
+	if !ok {
+		return nil, fmt.Errorf("failed to type assert sentence embedding tensor")
+	}
+	allEmbeds := sentenceEmbedTensor.GetData()
+
+	batchSize := len(batch)
+	embedDim := int(s.config.EmbedDim)
+	results := make([][]float32, batchSize)
+
+	for b := 0; b < batchSize; b++ {
+		start := b * embedDim
+		end := start + embedDim
+		results[b] = allEmbeds[start:end]
+	}
+
+	return results, nil
+}
+
+func (s *Service) ChunkText(ids []int64) [][]int64 {
+	var chunks [][]int64
+	for i:=0; i<len(ids); i += int(s.config.SeqLen) {
+		end := min(i + int(s.config.SeqLen), len(ids))
+		chunks = append(chunks, ids[i:end])
+	}
+	return chunks
 }
