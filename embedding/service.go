@@ -26,24 +26,43 @@ func DefaultConfig() *Config {
 
 // Service handles embedding operations
 type Service struct {
-	config *Config
+	config  *Config
+	session *ort.DynamicAdvancedSession
 }
 
 // NewService creates a new embedding service
-func NewService(config *Config) *Service {
+func NewService(config *Config) (*Service, error) {
 	if config == nil {
 		config = DefaultConfig()
 	}
-	return &Service{config: config}
-}
 
-// initializeONNXRuntime sets up the ONNX runtime environment
-func (s *Service) initializeONNXRuntime() error {
-	// Initialize ONNX runtime
 	ONNX_RUNTIME := os.Getenv("ONNX_RUNTIME")
 	ort.SetSharedLibraryPath(ONNX_RUNTIME)
-	err := ort.InitializeEnvironment()
-	return err
+	if err := ort.InitializeEnvironment(); err != nil {
+		return nil, fmt.Errorf("failed to init ONNX env: %v", err)
+	}
+
+	session, err := ort.NewDynamicAdvancedSession(
+		config.ModelPath,
+		[]string{"input_ids", "attention_mask"},
+		[]string{"token_embeddings", "sentence_embedding"},
+		nil,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create dynamic session: %w", err)
+	}
+	return &Service{
+		config:  config,
+		session: session,
+	}, nil
+
+}
+
+func (s *Service) Close() {
+	if s.session != nil {
+		s.session.Destroy()
+	}
+	ort.DestroyEnvironment()
 }
 
 // prepareTensors creates and prepares input/output tensors for inference
@@ -90,21 +109,16 @@ func (s *Service) prepareTensors(ids []int64) (*onnx.ModelIO, error) {
 
 	// Create ModelIO and configure inputs/outputs
 	io := &onnx.ModelIO{}
-	io.AddInput("input_ids", inputIdsTensor)
-	io.AddInput("attention_mask", attMaskTensor)
-	io.AddOutput("token_embeddings", tokenEmbedsTensor)
-	io.AddOutput("sentence_embedding", sentenceEmbedTensor)
+	io.AddInput(inputIdsTensor)
+	io.AddInput(attMaskTensor)
+	io.AddOutput(tokenEmbedsTensor)
+	io.AddOutput(sentenceEmbedTensor)
 
 	return io, nil
 }
 
 // Generate creates embeddings for the given token IDs
 func (s *Service) Generate(ids []int64) ([]float32, error) {
-	// Initialize ONNX runtime
-	if err := s.initializeONNXRuntime(); err != nil {
-		return nil, fmt.Errorf("failed to init ONNX runtime environment: %v", err)
-	}
-	defer ort.DestroyEnvironment()
 
 	// Prepare tensors
 	io, err := s.prepareTensors(ids)
@@ -122,15 +136,8 @@ func (s *Service) Generate(ids []int64) ([]float32, error) {
 		}
 	}()
 
-	// Create session
-	session, err := io.AttachToSession(s.config.ModelPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create session: %v", err)
-	}
-	defer session.Destroy()
-
 	// Run inference
-	if err := session.Run(); err != nil {
+	if err := s.session.Run(io.InputTensors, io.OutputTensors); err != nil {
 		return nil, fmt.Errorf("inference failed: %v", err)
 	}
 
@@ -188,20 +195,18 @@ func (s *Service) prepareBatchTensors(batch [][]int64) (*onnx.ModelIO, error) {
 	}
 
 	io := &onnx.ModelIO{}
-	io.AddInput("input_ids", inputIdsTensor)
-	io.AddInput("attention_mask", attMaskTensor)
-	io.AddOutput("token_embeddings", tokenEmbedsTensor)
-	io.AddOutput("sentence_embedding", sentenceEmbedTensor)
+	io.AddInput(inputIdsTensor)
+	io.AddInput(attMaskTensor)
+	io.AddOutput(tokenEmbedsTensor)
+	io.AddOutput(sentenceEmbedTensor)
 
 	return io, nil
 }
 
 // GenerateBatch processes multiple sequences at once
 func (s *Service) GenerateBatch(batch [][]int64) ([][]float32, error) {
-	if err := s.initializeONNXRuntime(); err != nil {
-		return nil, fmt.Errorf("failed to init ONNX runtime: %v", err)
-	}
 
+	// prepare batch tensors
 	io, err := s.prepareBatchTensors(batch)
 	if err != nil {
 		return nil, err
@@ -217,13 +222,7 @@ func (s *Service) GenerateBatch(batch [][]int64) ([][]float32, error) {
 		}
 	}()
 
-	session, err := io.AttachToSession(s.config.ModelPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create session: %v", err)
-	}
-	defer session.Destroy()
-
-	if err := session.Run(); err != nil {
+	if err := s.session.Run(io.InputTensors, io.OutputTensors); err != nil {
 		return nil, fmt.Errorf("inference failed: %v", err)
 	}
 
@@ -250,8 +249,8 @@ func (s *Service) GenerateBatch(batch [][]int64) ([][]float32, error) {
 
 func (s *Service) ChunkText(ids []int64) [][]int64 {
 	var chunks [][]int64
-	for i:=0; i<len(ids); i += int(s.config.SeqLen) {
-		end := min(i + int(s.config.SeqLen), len(ids))
+	for i := 0; i < len(ids); i += int(s.config.SeqLen) {
+		end := min(i+int(s.config.SeqLen), len(ids))
 		chunks = append(chunks, ids[i:end])
 	}
 	return chunks

@@ -28,11 +28,15 @@ func main() {
 
 	ids := textCodec.Encode(text)
 
-	svc := embedding.NewService(nil)
+	svc, err := embedding.NewService(nil)
+	if err != nil {
+		log.Fatalf("unable to get new service: %v", err)
+	}
+	defer svc.Close()
 	chunkedIds := svc.ChunkText(ids)
 	embeddings, err := svc.GenerateBatch(chunkedIds)
 	if err != nil {
-		log.Fatalln("Unable to generate embeddings")
+		log.Fatalf("Unable to generate embeddings: %v", err)
 	}
 	fmt.Println(len(embeddings))
 }
