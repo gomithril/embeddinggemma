@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"github.com/gomithril/embeddinggemma/onnx"
+	"github.com/rs/zerolog/log"
 	ort "github.com/yalue/onnxruntime_go"
 )
 
@@ -125,16 +126,8 @@ func (s *Service) Generate(ids []int64) ([]float32, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	// Ensure cleanup of tensors
-	defer func() {
-		for _, tensor := range io.InputTensors {
-			tensor.Destroy()
-		}
-		for _, tensor := range io.OutputTensors {
-			tensor.Destroy()
-		}
-	}()
+	defer io.Destroy()
 
 	// Run inference
 	if err := s.session.Run(io.InputTensors, io.OutputTensors); err != nil {
@@ -211,16 +204,7 @@ func (s *Service) GenerateBatch(batch [][]int64) ([][]float32, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	defer func() {
-		for _, tensor := range io.InputTensors {
-			tensor.Destroy()
-		}
-
-		for _, tensor := range io.OutputTensors {
-			tensor.Destroy()
-		}
-	}()
+	defer io.Destroy()
 
 	if err := s.session.Run(io.InputTensors, io.OutputTensors); err != nil {
 		return nil, fmt.Errorf("inference failed: %v", err)
@@ -254,4 +238,81 @@ func (s *Service) ChunkText(ids []int64) [][]int64 {
 		chunks = append(chunks, ids[i:end])
 	}
 	return chunks
+}
+
+func (s *Service) GenerateBatchConcurrently(batchChunks [][]int64, batchSize int) ([][]float32, error) {
+	type result struct {
+		index int
+		embed []float32
+		err   error
+	}
+
+	numChunks := len(batchChunks)
+	results := make([][]float32, numChunks)
+
+	resultCh := make(chan result, numChunks)
+
+	worker := func(start, end int) {
+		log.Info().Msgf("Worker started for chunks %d to %d", start, end-1)
+		batch := batchChunks[start:end]
+
+		io, err := s.prepareBatchTensors(batch)
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to prepare batch tensors")
+			for i := start; i < end; i++ {
+				resultCh <- result{index: i, embed: nil, err: err}
+			}
+		}
+		log.Info().Msgf("Created tensors for batch %d-%d", start, end-1)
+		defer func() {
+			io.Destroy()
+			log.Info().Msgf("Destroyed tensors for batch %d-%d", start, end-1)
+		}()
+		if err := s.session.Run(io.InputTensors, io.OutputTensors); err != nil {
+			log.Error().Err(err).Msgf("Inference failed for batch %d-%d", start, end-1)
+			for i := start; i < end; i++ {
+				resultCh <- result{index: i, embed: nil, err: err}
+			}
+			return
+		}
+		log.Info().Msgf("Completed inference for batch %d-%d", start, end-1)
+
+		sentenceEmbedValue := io.OutputTensors[len(io.OutputTensors)-1]
+		sentenceEmbedTensor, ok := sentenceEmbedValue.(*ort.Tensor[float32])
+		if !ok {
+			err := fmt.Errorf("type assertion failed for batch %d-%d", start, end-1)
+			log.Error().Err(err).Msg("Failed to type assert tensor")
+			for i := start; i < end; i++ {
+				resultCh <- result{index: i, embed: nil, err: err}
+			}
+			return
+		}
+		allEmbeds := sentenceEmbedTensor.GetData()
+		embedDim := int(s.config.EmbedDim)
+		for b := 0; b < len(batch); b++ {
+			startIdx := b * embedDim
+			endIdx := startIdx + embedDim
+			resultCh <- result{index: start + b, embed: allEmbeds[startIdx:endIdx], err: nil}
+		}
+	}
+
+	// Launch workers
+	for i := 0; i < numChunks; i += batchSize {
+		end := i + batchSize
+		if end > numChunks {
+			end = numChunks
+		}
+		go worker(i, end)
+	}
+
+	// Collect results
+	for i := 0; i < numChunks; i++ {
+		r := <-resultCh
+		if r.err != nil {
+			return nil, r.err
+		}
+		results[r.index] = r.embed
+	}
+	log.Info().Msg("All batches processed successfully")
+	return results, nil
 }

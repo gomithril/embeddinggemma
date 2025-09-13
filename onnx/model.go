@@ -19,3 +19,13 @@ func (io *ModelIO) AddInput(tensor ort.Value) {
 func (io *ModelIO) AddOutput(tensor ort.Value) {
 	io.OutputTensors = append(io.OutputTensors, tensor)
 }
+
+func (io *ModelIO) Destroy() {
+	for _, tensor := range io.InputTensors {
+		tensor.Destroy()
+	}
+
+	for _, tensor := range io.OutputTensors {
+		tensor.Destroy()
+	}
+}
